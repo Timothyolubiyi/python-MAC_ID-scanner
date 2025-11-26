@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-LAN MAC Scanner — Full edition
+Advanced LAN MAC Scanner — Enhanced edition with OEM vendor lookup
 Features:
  - CLI and GUI (Tkinter)
  - Scapy ARP scan (if scapy available and permitted)
  - Fallback: ping sweep to populate ARP table, then parse ARP table
- - Export to JSON or CSV
+ - OUI (Organizational Unique Identifier) database for vendor lookup
+ - Hostname resolution via reverse DNS
+ - IP geolocation hints (private vs public ranges)
+ - Export to JSON or CSV with full device details
  - Accepts explicit IP range/network or IP start-end
  - Optionally choose a network interface (best-effort)
 """
@@ -22,6 +25,10 @@ import json
 import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
+from urllib.request import urlopen
+from urllib.error import URLError
+import threading
 
 # Optional GUI import (Tkinter is in stdlib)
 try:
@@ -45,7 +52,92 @@ try:
 except Exception:
     PSUTIL_AVAILABLE = False
 
-# ---------- Utility functions ----------
+# ---------- OUI Database management ----------
+
+OUI_CACHE_FILE = Path.home() / ".cache" / "oui.txt"
+OUI_URL = "http://standards-oui.ieee.org/oui/oui.txt"
+
+def ensure_oui_database():
+    """Download and cache OUI database if not present."""
+    OUI_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if OUI_CACHE_FILE.exists():
+        # Use cached version
+        return OUI_CACHE_FILE
+    
+    print("Downloading OUI database from IEEE (first run)...")
+    try:
+        response = urlopen(OUI_URL, timeout=10)
+        content = response.read().decode('utf-8', errors='ignore')
+        with open(OUI_CACHE_FILE, 'w', encoding='utf-8') as f:
+            f.write(content)
+        print(f"OUI database cached at {OUI_CACHE_FILE}")
+        return OUI_CACHE_FILE
+    except (URLError, Exception) as e:
+        print(f"Warning: Could not download OUI database: {e}. Vendor lookup will be limited.")
+        return None
+
+def load_oui_database():
+    """Load OUI database and return dict of MAC prefix -> vendor."""
+    oui_file = ensure_oui_database()
+    if not oui_file or not oui_file.exists():
+        return {}
+    
+    oui_dict = {}
+    try:
+        with open(oui_file, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                # Format: AABBCC (hex) TAB Vendor Name
+                if re.match(r'^[0-9A-F]{6}\s+\(hex\)', line):
+                    parts = line.split('\t', 1)
+                    if len(parts) == 2:
+                        mac_prefix = parts[0].split()[0].lower()  # e.g., "aabbcc"
+                        vendor = parts[1].strip()
+                        oui_dict[mac_prefix] = vendor
+    except Exception as e:
+        print(f"Error loading OUI database: {e}")
+    return oui_dict
+
+def lookup_vendor(mac_address, oui_dict):
+    """Lookup vendor for a MAC address using OUI database."""
+    if not oui_dict:
+        return "Unknown"
+    # Extract first 3 octets (6 hex chars)
+    mac_clean = mac_address.replace(':', '').replace('-', '').lower()[:6]
+    return oui_dict.get(mac_clean, "Unknown")
+
+# ---------- Hostname resolution ----------
+
+def resolve_hostname(ip_str, timeout=1):
+    """Attempt reverse DNS lookup for IP."""
+    try:
+        hostname, _, _ = socket.gethostbyaddr(ip_str)
+        return hostname
+    except (socket.herror, socket.timeout, Exception):
+        return None
+
+def resolve_hostnames_concurrent(ips, max_workers=50):
+    """Resolve hostnames for multiple IPs concurrently."""
+    hostnames = {}
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(ips))) as ex:
+        futures = {ex.submit(resolve_hostname, ip): ip for ip in ips}
+        for fut in as_completed(futures):
+            ip = futures[fut]
+            try:
+                hostname = fut.result()
+                if hostname:
+                    hostnames[ip] = hostname
+            except Exception:
+                pass
+    return hostnames
+
+def is_private_ip(ip_str):
+    """Check if IP is in a private range."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return ip.is_private
+    except Exception:
+        return False
 
 def get_local_ip():
     """Get the primary local IP by opening a UDP socket (doesn't send packets)."""
@@ -222,17 +314,23 @@ def parse_arp_table():
         seen[ip] = mac
     return list(seen.items())
 
-# ---------- High-level scanner ----------
+# ---------- High-level scanner with enrichment ----------
 
-def scan_network(range_or_net=None, interface=None, prefer_scapy=True, max_hosts_limit=1024):
+def scan_network(range_or_net=None, interface=None, prefer_scapy=True, max_hosts_limit=1024, resolve_hostnames=True):
     """
     range_or_net: ipaddress.IPv4Network or list of ip strings or None (auto-detect)
     interface: not currently used to bind scapy; it's informational / for UI
     prefer_scapy: use scapy if available
+    resolve_hostnames: attempt reverse DNS lookups
+    
+    Returns list of dicts: {ip, mac, vendor, hostname, ip_type, private}
     """
     local_ip = get_local_ip()
     if not local_ip and range_or_net is None:
         raise RuntimeError("Cannot determine local IP and no range was provided.")
+
+    # Load OUI database for vendor lookup
+    oui_dict = load_oui_database()
 
     # Decide network to scan
     if range_or_net is None:
@@ -240,64 +338,93 @@ def scan_network(range_or_net=None, interface=None, prefer_scapy=True, max_hosts
     else:
         net = range_or_net
 
-    results = []
+    raw_results = []
 
     # If scapy available and preferred, try it first
     use_scapy = SCAPY_AVAILABLE and prefer_scapy
     if use_scapy:
         try:
-            # scapy arping accepts networks or IP ranges
             print("Attempting scapy ARP scan (recommended; requires root/admin).")
             scapy_results = scapy_scan(net)
             if scapy_results:
-                # normalize macs
-                return sorted(list({ip: mac for ip, mac in scapy_results}.items()), key=lambda x: ipaddress.ip_address(x[0]))
+                raw_results = list({ip: mac for ip, mac in scapy_results}.items())
             else:
                 print("Scapy scan returned no results or not permitted. Falling back.")
         except Exception as e:
             print(f"Scapy scan error: {e}. Falling back to ping+arp.")
 
     # Fallback method: ping sweep and parse arp
-    print("Using ping sweep + ARP table parsing (fallback). This may take a while for large ranges.")
-    ip_list = []
-    if isinstance(net, list):
-        ip_list = net
-    elif isinstance(net, ipaddress._BaseNetwork):
-        # build host list but cap
-        hosts = list(net.hosts())
-        if len(hosts) > max_hosts_limit:
-            print(f"Network has {len(hosts)} hosts; limiting to first {max_hosts_limit} hosts for safety.")
-            hosts = hosts[:max_hosts_limit]
-        ip_list = [str(h) for h in hosts]
-    else:
-        # single IP network
-        try:
-            ip_list = [str(ip) for ip in net.hosts()]
-        except Exception:
-            ip_list = [str(net)]
+    if not raw_results:
+        print("Using ping sweep + ARP table parsing (fallback). This may take a while for large ranges.")
+        ip_list = []
+        if isinstance(net, list):
+            ip_list = net
+        elif isinstance(net, ipaddress._BaseNetwork):
+            # build host list but cap
+            hosts = list(net.hosts())
+            if len(hosts) > max_hosts_limit:
+                print(f"Network has {len(hosts)} hosts; limiting to first {max_hosts_limit} hosts for safety.")
+                hosts = hosts[:max_hosts_limit]
+            ip_list = [str(h) for h in hosts]
+        else:
+            # single IP network
+            try:
+                ip_list = [str(ip) for ip in net.hosts()]
+            except Exception:
+                ip_list = [str(net)]
 
-    # Ping to populate ARP table
-    populate_arp_table_for_ips(ip_list)
+        # Ping to populate ARP table
+        populate_arp_table_for_ips(ip_list)
 
-    # Now parse ARP table
-    arp_entries = parse_arp_table()
-    # Filter to only those in our ip_list if ip_list was limited
-    if ip_list:
-        arp_filtered = [(ip, mac) for ip, mac in arp_entries if ip in set(ip_list)]
-    else:
-        arp_filtered = arp_entries
+        # Now parse ARP table
+        arp_entries = parse_arp_table()
+        # Filter to only those in our ip_list if ip_list was limited
+        if ip_list:
+            arp_filtered = [(ip, mac) for ip, mac in arp_entries if ip in set(ip_list)]
+        else:
+            arp_filtered = arp_entries
 
-    # Sort and return unique by IP
-    seen = {}
-    for ip, mac in arp_filtered:
-        seen[ip] = mac
-    results = sorted(list(seen.items()), key=lambda x: ipaddress.ip_address(x[0]))
-    return results
+        # Sort and return unique by IP
+        seen = {}
+        for ip, mac in arp_filtered:
+            seen[ip] = mac
+        raw_results = sorted(list(seen.items()), key=lambda x: ipaddress.ip_address(x[0]))
+
+    # Enrich results with hostname and vendor info
+    print("Enriching results with vendor and hostname information...")
+    ips = [ip for ip, _ in raw_results]
+    hostnames = resolve_hostnames_concurrent(ips) if resolve_hostnames else {}
+
+    enriched = []
+    for ip, mac in raw_results:
+        vendor = lookup_vendor(mac, oui_dict)
+        hostname = hostnames.get(ip, "")
+        is_private = is_private_ip(ip)
+        ip_type = "Private" if is_private else "Public"
+        
+        enriched.append({
+            "ip": ip,
+            "mac": mac,
+            "vendor": vendor,
+            "hostname": hostname,
+            "ip_type": ip_type,
+            "private": is_private
+        })
+
+    return enriched
 
 # ---------- Export helpers ----------
 
 def export_json(results, outfile):
-    data = [{"ip": ip, "mac": mac} for ip, mac in results]
+    data = []
+    for entry in results:
+        data.append({
+            "ip": entry["ip"],
+            "mac": entry["mac"],
+            "vendor": entry["vendor"],
+            "hostname": entry["hostname"],
+            "ip_type": entry["ip_type"]
+        })
     with open(outfile, "w", encoding="utf-8") as f:
         json.dump({"scanned_at": datetime.utcnow().isoformat() + "Z", "results": data}, f, indent=2)
     print(f"Exported {len(results)} entries to JSON: {outfile}")
@@ -305,9 +432,9 @@ def export_json(results, outfile):
 def export_csv(results, outfile):
     with open(outfile, "w", newline='', encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["ip", "mac"])
-        for ip, mac in results:
-            writer.writerow([ip, mac])
+        writer.writerow(["IP", "MAC", "Vendor (OEM)", "Hostname", "IP Type"])
+        for entry in results:
+            writer.writerow([entry["ip"], entry["mac"], entry["vendor"], entry["hostname"], entry["ip_type"]])
     print(f"Exported {len(results)} entries to CSV: {outfile}")
 
 # ---------- CLI and argument parsing ----------
@@ -333,7 +460,13 @@ def cli_main(args):
                 print(f"Warning: interface '{args.interface}' not found among detected interfaces: {interfaces}")
 
     try:
-        results = scan_network(range_parsed, interface=args.interface, prefer_scapy=not args.no_scapy, max_hosts_limit=args.max_hosts)
+        results = scan_network(
+            range_parsed,
+            interface=args.interface,
+            prefer_scapy=not args.no_scapy,
+            max_hosts_limit=args.max_hosts,
+            resolve_hostnames=not args.no_dns
+        )
     except Exception as e:
         print(f"Scan failed: {e}")
         sys.exit(1)
@@ -341,11 +474,19 @@ def cli_main(args):
     if not results:
         print("No devices discovered.")
     else:
-        print("\nDiscovered devices (IP -> MAC):")
-        print("{:<16}  {}".format("IP", "MAC"))
-        print("-" * 36)
-        for ip, mac in results:
-            print(f"{ip:<16}  {mac}")
+        print("\nDiscovered devices:")
+        print("{:<16}  {:<18}  {:<30}  {:<25}  {}".format("IP", "MAC", "Vendor (OEM)", "Hostname", "Type"))
+        print("-" * 110)
+        for entry in results:
+            hostname = entry["hostname"][:25] if entry["hostname"] else "(no hostname)"
+            vendor = entry["vendor"][:28]
+            print("{:<16}  {:<18}  {:<30}  {:<25}  {}".format(
+                entry["ip"],
+                entry["mac"],
+                vendor,
+                hostname,
+                entry["ip_type"]
+            ))
         print(f"\nTotal found: {len(results)}")
 
     if args.json:
@@ -353,13 +494,13 @@ def cli_main(args):
     if args.csv:
         export_csv(results, args.csv)
 
-# ---------- Simple GUI ----------
+# ---------- Enhanced GUI ----------
 
-class ScannerGUI(tk.Tk):
+class EnhancedScannerGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("LAN MAC Scanner")
-        self.geometry("800x500")
+        self.title("Advanced LAN MAC Scanner")
+        self.geometry("1200x600")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # Top frame for options
@@ -379,18 +520,30 @@ class ScannerGUI(tk.Tk):
         self.range_var = tk.StringVar()
         ttk.Entry(opt_frame, textvariable=self.range_var, width=40).grid(row=1, column=1, sticky="w", padx=4)
 
+        # Checkboxes for options
+        self.resolve_dns_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_frame, text="Resolve Hostnames", variable=self.resolve_dns_var).grid(row=0, column=2, padx=8)
+
         self.scan_btn = ttk.Button(opt_frame, text="Start Scan", command=self.start_scan)
-        self.scan_btn.grid(row=0, column=2, rowspan=2, padx=8)
+        self.scan_btn.grid(row=0, column=3, rowspan=2, padx=8)
 
         self.progress = ttk.Label(opt_frame, text="")
-        self.progress.grid(row=2, column=0, columnspan=3, sticky="w", pady=4)
+        self.progress.grid(row=2, column=0, columnspan=4, sticky="w", pady=4)
 
-        # Treeview for results
-        self.tree = ttk.Treeview(self, columns=("ip", "mac"), show="headings")
-        self.tree.heading("ip", text="IP")
-        self.tree.heading("mac", text="MAC")
-        self.tree.column("ip", width=160)
-        self.tree.column("mac", width=200)
+        # Treeview for results with more columns
+        self.tree = ttk.Treeview(self, columns=("ip", "mac", "vendor", "hostname", "type"), show="headings")
+        self.tree.heading("ip", text="IP Address")
+        self.tree.heading("mac", text="MAC Address")
+        self.tree.heading("vendor", text="Vendor (OEM)")
+        self.tree.heading("hostname", text="Hostname")
+        self.tree.heading("type", text="Type")
+        
+        self.tree.column("ip", width=120)
+        self.tree.column("mac", width=140)
+        self.tree.column("vendor", width=250)
+        self.tree.column("hostname", width=200)
+        self.tree.column("type", width=80)
+        
         self.tree.pack(fill="both", expand=True, padx=8, pady=8)
 
         # Bottom buttons
@@ -417,7 +570,6 @@ class ScannerGUI(tk.Tk):
         rng = self.range_var.get().strip()
         iface = None
         if self.iface_var.get():
-            # extract ip from displayed combo value
             selected = self.iface_var.get()
             m = re.search(r"\(([\d\.]+)\)$", selected)
             if m:
@@ -436,14 +588,17 @@ class ScannerGUI(tk.Tk):
         self.set_progress("Scanning... (this may take a while)")
         self.scan_btn.config(state="disabled")
         self.update_idletasks()
-        # Run scan in background thread to keep UI responsive
-        import threading
-        t = threading.Thread(target=self._run_scan_thread, args=(parsed, iface), daemon=True)
+        
+        t = threading.Thread(
+            target=self._run_scan_thread,
+            args=(parsed, iface, self.resolve_dns_var.get()),
+            daemon=True
+        )
         t.start()
 
-    def _run_scan_thread(self, parsed, iface):
+    def _run_scan_thread(self, parsed, iface, resolve_dns):
         try:
-            results = scan_network(parsed, interface=iface)
+            results = scan_network(parsed, interface=iface, resolve_hostnames=resolve_dns)
             self.results = results
             self._populate_tree(results)
             self.set_progress(f"Scan complete: {len(results)} devices found.")
@@ -454,10 +609,15 @@ class ScannerGUI(tk.Tk):
             self.scan_btn.config(state="normal")
 
     def _populate_tree(self, results):
-        # populate Treeview in main thread
         def _insert():
-            for ip, mac in results:
-                self.tree.insert("", "end", values=(ip, mac))
+            for entry in results:
+                self.tree.insert("", "end", values=(
+                    entry["ip"],
+                    entry["mac"],
+                    entry["vendor"],
+                    entry["hostname"],
+                    entry["ip_type"]
+                ))
         self.after(0, _insert)
 
     def export_json_gui(self):
@@ -484,13 +644,14 @@ class ScannerGUI(tk.Tk):
 # ---------- Entrypoint ----------
 
 def main():
-    parser = argparse.ArgumentParser(description="LAN MAC Scanner — CLI + GUI")
+    parser = argparse.ArgumentParser(description="Advanced LAN MAC Scanner — with OEM vendor lookup and hostname resolution")
     parser.add_argument("--range", "-r", help="IP range to scan (CIDR like 192.168.1.0/24 or start-end like 192.168.1.10-192.168.1.50)")
     parser.add_argument("--interface", "-i", help="Network interface name or IP (best-effort, informational)")
     parser.add_argument("--json", help="Export results to JSON file")
     parser.add_argument("--csv", help="Export results to CSV file")
     parser.add_argument("--gui", action="store_true", help="Open the Tkinter GUI")
     parser.add_argument("--no-scapy", action="store_true", help="Do not attempt to use scapy even if installed")
+    parser.add_argument("--no-dns", action="store_true", help="Skip hostname resolution (faster)")
     parser.add_argument("--max-hosts", type=int, default=1024, help="Max hosts to scan for large networks (default 1024)")
     args = parser.parse_args()
 
@@ -498,7 +659,7 @@ def main():
         if not GUI_AVAILABLE:
             print("GUI modules not available. Tkinter not found.")
             sys.exit(1)
-        app = ScannerGUI()
+        app = EnhancedScannerGUI()
         app.mainloop()
         return
 
