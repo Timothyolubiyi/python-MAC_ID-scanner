@@ -24,3 +24,6 @@ You must run this on the same Layer-2 network as the target devices (same LAN/su
 Some devices may not respond to pings or ARP (firewall, privacy features), so they may not appear.
 
 Running ARP scans typically requires elevated privileges (root / Administrator). The script will still try the arp -a fallback without root, but results may be limited.
+
+<img width="1256" height="334" alt="Image" src="https://github.com/user-attachments/assets/12794d6a-914a-485d-b579-b833c7a6d549" />
+
